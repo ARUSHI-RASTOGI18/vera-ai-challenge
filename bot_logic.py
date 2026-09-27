@@ -1900,3 +1900,413 @@ if __name__ == "__main__":
     print("TEST COMPLETE")
 
     print("=" * 70)
+
+    
+# ============================================================
+# VERA AI — SCORING BOOST PATCH
+# Append this block to the END of bot_logic.py
+# ============================================================
+
+def _safe_percent(value):
+    if value is None:
+        return None
+    try:
+        pct = float(value) * 100 if abs(float(value)) <= 1 else float(value)
+        return f"{pct:.0f}%"
+    except Exception:
+        return str(value)
+
+
+def _offer_text(merchant):
+    offer = get_best_offer(merchant)
+    if not offer:
+        return None
+    title = offer.get("title") or offer.get("name")
+    price = offer.get("price")
+    if title and price is not None:
+        return f"{title} @ ₹{price}"
+    return title
+
+
+def _specialized_action(trigger, merchant, body, template_name, rationale,
+                        customer=None, cta="open_ended"):
+    return build_action(
+        trigger=trigger,
+        merchant=merchant,
+        customer=customer,
+        body=body,
+        template_name=template_name,
+        template_params=[],
+        cta=cta,
+        rationale=rationale
+    )
+
+
+# ------------------------------------------------------------
+# STRONGER CUSTOMER COMPOSER
+# ------------------------------------------------------------
+
+def compose_customer_recall(trigger, merchant, category, customer):
+    payload = trigger.get("payload") or {}
+    customer_name = (
+        customer.get("first_name")
+        or customer.get("name")
+        or "there"
+    )
+
+    kind = trigger.get("kind", "")
+    slots = payload.get("available_slots") or payload.get("next_session_options") or []
+
+    labels = []
+    for slot in slots[:3]:
+        if isinstance(slot, dict):
+            label = slot.get("label") or slot.get("display")
+            if label:
+                labels.append(str(label))
+        elif slot:
+            labels.append(str(slot))
+
+    offer = _offer_text(merchant)
+
+    if kind in {"customer_lapsed_soft", "customer_lapsed_hard"}:
+        days = payload.get("days_since_last_visit")
+        focus = payload.get("previous_focus")
+        if labels:
+            slot_text = " or ".join(labels[:2])
+        else:
+            slot_text = None
+
+        detail = []
+        if days is not None:
+            detail.append(f"it's been {days} days since your last visit")
+        if focus:
+            detail.append(f"you were previously working on {focus}")
+
+        body = f"Hi {customer_name}, {merchant_name(merchant)} here. "
+        body += " — ".join(detail) if detail else "we'd love to have you back"
+        body += ". "
+        if offer:
+            body += f"We currently have {offer}. "
+        if slot_text:
+            body += f"I can hold {slot_text} if either works for you."
+        else:
+            body += "Want me to help find a convenient time?"
+
+        return _specialized_action(
+            trigger, merchant, body, "vera_customer_winback_v2",
+            "Uses the lapse duration, prior customer intent and actual merchant offer/slots when supplied, with a low-friction return CTA.",
+            customer=customer,
+            cta="open_ended"
+        )
+
+    if kind == "trial_followup":
+        trial_date = payload.get("trial_date")
+        if labels:
+            body = (
+                f"Hi {customer_name}, {merchant_name(merchant)} here. "
+                f"Following up on your trial"
+                f"{' from ' + str(trial_date) if trial_date else ''}. "
+                f"Next available option: {labels[0]}"
+                f"{' or ' + labels[1] if len(labels) > 1 else ''}. "
+                "Would you like me to reserve one?"
+            )
+        else:
+            body = (
+                f"Hi {customer_name}, {merchant_name(merchant)} here. "
+                "Following up on your recent trial. "
+                "Would you like me to help arrange your next session?"
+            )
+
+        return _specialized_action(
+            trigger, merchant, body, "vera_trial_followup_v2",
+            "Continues the trial journey using the supplied trial date and next-session options rather than sending a generic reminder.",
+            customer=customer,
+            cta="open_ended"
+        )
+
+    if kind == "chronic_refill_due":
+        molecules = payload.get("molecule_list") or []
+        stock_out = payload.get("stock_runs_out_iso")
+        med_text = ", ".join(str(x) for x in molecules[:3])
+        body = (
+            f"Hi {customer_name}, {merchant_name(merchant)} here. "
+            f"Your refill reminder is due"
+            f"{' before ' + str(stock_out) if stock_out else ''}"
+            f"{': ' + med_text if med_text else ''}. "
+            "Would you like us to check availability and help arrange the refill?"
+        )
+
+        return _specialized_action(
+            trigger, merchant, body, "vera_chronic_refill_v2",
+            "Uses only the supplied refill timing and medicine list and asks the customer to confirm availability rather than making a medical recommendation.",
+            customer=customer,
+            cta="open_ended"
+        )
+
+    # Existing slot-based recall behavior, but more concrete.
+    slot_text = " or ".join(labels[:2]) if labels else None
+    body = f"Hi {customer_name}, {merchant_name(merchant)} here. "
+    body += "Your follow-up is due. "
+    if offer:
+        body += f"We currently have {offer}. "
+    if slot_text:
+        body += f"Available times: {slot_text}. Which works for you?"
+    else:
+        body += "Would you like me to help find a convenient time?"
+
+    return _specialized_action(
+        trigger, merchant, body, "vera_customer_recall_v2",
+        "Uses the customer-specific trigger and actual merchant offer/availability when supplied.",
+        customer=customer,
+        cta="open_ended"
+    )
+
+
+# ------------------------------------------------------------
+# STRONGER GENERIC/EDGE-TRIGGER COMPOSER
+# This overrides the old generic fallback without changing
+# the existing strong research/regulation/performance/renewal
+# composers.
+# ------------------------------------------------------------
+
+def compose_generic(trigger, merchant, category, customer=None):
+    kind = trigger.get("kind", "")
+    payload = trigger.get("payload") or {}
+    name = merchant_name(merchant)
+    first = merchant_first_name(merchant)
+    category_name = category.get("slug", "your category")
+    offer = _offer_text(merchant)
+
+    # REVIEW THEME
+    if kind == "review_theme_emerged":
+        theme = payload.get("theme") or payload.get("topic") or "a recurring issue"
+        occurrences = payload.get("occurrences_30d")
+        trend = payload.get("trend")
+        quote = payload.get("common_quote")
+
+        count_text = f"{occurrences} reviews in 30 days" if occurrences is not None else "multiple recent reviews"
+        trend_text = f", and the trend is {trend}" if trend else ""
+
+        body = (
+            f"{first}, {count_text} mention {theme}{trend_text}. "
+            f"That is specific enough to act on rather than treat as noise."
+        )
+        if quote:
+            body += f' One customer wording was: "{quote}".'
+        body += " Want me to turn this into one concrete fix + a reply template?"
+
+        return _specialized_action(
+            trigger, merchant, body, "vera_review_theme_v2",
+            "Turns the review pattern into an actionable merchant response using the supplied occurrence count, trend and customer wording."
+        )
+
+    # MILESTONE
+    if kind == "milestone_reached":
+        metric = payload.get("metric") or "milestone"
+        current = payload.get("value_now")
+        target = payload.get("milestone_value")
+
+        if current is not None and target is not None:
+            body = (
+                f"{first}, you're at {current} {metric.replace('_', ' ')} "
+                f"with {target - current} to go to {target}. "
+                "You're close enough that the next step is worth planning now. "
+                "Want me to draft a simple push to help reach it?"
+            )
+        elif target is not None:
+            body = (
+                f"{first}, you're approaching the {target} {metric.replace('_', ' ')} milestone. "
+                "Want me to draft one concrete action to help get there?"
+            )
+        else:
+            body = (
+                f"{first}, you just hit a {metric.replace('_', ' ')} milestone. "
+                "Want me to turn it into a simple customer-facing update?"
+            )
+
+        return _specialized_action(
+            trigger, merchant, body, "vera_milestone_v2",
+            "Uses the supplied milestone metric and values to create a concrete next action."
+        )
+
+    # ACTIVE PLANNING INTENT — give the merchant an artifact immediately.
+    if kind == "active_planning_intent":
+        topic = payload.get("intent_topic") or payload.get("topic") or "the idea"
+        last_message = payload.get("merchant_last_message")
+
+        body = (
+            f"{first}, since you're already planning {topic.replace('_', ' ')}, "
+            "here's the quickest next step: let's turn it into a first draft you can edit."
+        )
+        if offer:
+            body += f" I can anchor it around your current {offer} where relevant."
+        if last_message:
+            body += f' You asked: "{last_message}"'
+        body += " Want me to draft the actual customer-facing version now?"
+
+        return _specialized_action(
+            trigger, merchant, body, "vera_active_planning_v2",
+            "Recognizes an active planning intent and moves directly to an artifact instead of restarting qualification."
+        )
+
+    # SEASONAL PERFORMANCE DIP
+    if kind in {"seasonal_perf_dip", "seasonal_acquisition_dip"}:
+        metric = payload.get("metric") or "performance"
+        delta = _safe_percent(payload.get("delta_pct"))
+        window = payload.get("window")
+        expected = payload.get("is_expected_seasonal")
+        note = payload.get("season_note")
+
+        if expected:
+            body = (
+                f"{first}, {metric} is {delta + ' ' if delta else ''}down"
+                f"{' over ' + str(window) if window else ''}, "
+                "and this trigger flags the dip as seasonal rather than an anomaly."
+            )
+            if note:
+                body += f" ({str(note).replace('_', ' ')})."
+            body += (
+                " I would avoid reacting with blanket spend and instead focus on "
+                "a concrete retention or demand-capture action. Want me to draft one?"
+            )
+        else:
+            body = (
+                f"{first}, {metric} is showing a {delta + ' ' if delta else ''}change"
+                f"{' over ' + str(window) if window else ''}. "
+                "Want me to turn the signal into one concrete action to test?"
+            )
+
+        return _specialized_action(
+            trigger, merchant, body, "vera_seasonal_perf_v2",
+            "Reframes an explicitly seasonal performance signal instead of treating every dip as a generic performance problem."
+        )
+
+    # PERFORMANCE SPIKE
+    if kind == "perf_spike":
+        metric = payload.get("metric") or "performance"
+        delta = _safe_percent(payload.get("delta_pct"))
+        window = payload.get("window")
+
+        body = (
+            f"{first}, {metric} is up {delta or 'recently'}"
+            f"{' over ' + str(window) if window else ''}. "
+            "Before the signal fades, this is a good moment to capture what worked "
+            "and turn it into a repeatable action. Want me to help isolate the likely driver?"
+        )
+
+        return _specialized_action(
+            trigger, merchant, body, "vera_perf_spike_v2",
+            "Uses the supplied positive performance movement and proposes a repeatable next action."
+        )
+
+    # DORMANT
+    if kind == "dormant_with_vera":
+        days = payload.get("days_since_last_message") or payload.get("days")
+        body = (
+            f"{first}, we haven't had a useful working conversation"
+            f"{' in ' + str(days) + ' days' if days is not None else ' recently'}. "
+            "Rather than send a generic nudge, I have one concrete item ready. "
+            "Want to pick up from there?"
+        )
+
+        return _specialized_action(
+            trigger, merchant, body, "vera_dormant_reengage_v2",
+            "Uses the dormancy signal to reopen the working relationship without pretending there is a business problem."
+        )
+
+    # COMPETITOR
+    if kind == "competitor_opened":
+        distance = payload.get("distance_km")
+        competitor = payload.get("competitor_name") or payload.get("name")
+        category_text = payload.get("category") or category_name
+
+        body = (
+            f"{first}, a new {category_text} competitor"
+            f"{' (' + str(competitor) + ')' if competitor else ''}"
+            f"{' is about ' + str(distance) + ' km away' if distance is not None else ''}. "
+            "The useful response is to protect your existing demand, not panic. "
+            "Want me to suggest one concrete profile/offer move?"
+        )
+
+        return _specialized_action(
+            trigger, merchant, body, "vera_competitor_v2",
+            "Frames the competitor event around a concrete defensive action using only supplied competitor details."
+        )
+
+    # FESTIVAL / EVENT
+    if kind in {"festival_upcoming", "festival"}:
+        title = payload.get("festival") or payload.get("title") or "the upcoming event"
+        days = payload.get("days_until") or payload.get("days")
+        offer_text = f" Your active {offer} can be the anchor." if offer else ""
+
+        body = (
+            f"{first}, {title} is coming up"
+            f"{' in ' + str(days) + ' days' if days is not None else ''}."
+            f"{offer_text} "
+            "Instead of a generic festival post, want me to draft one specific offer angle "
+            "and the WhatsApp copy for it?"
+        )
+
+        return _specialized_action(
+            trigger, merchant, body, "vera_festival_v2",
+            "Connects the upcoming event to an actual merchant offer when available and proposes a concrete deliverable."
+        )
+
+    # SUPPLY ALERT / RECALL
+    if kind in {"supply_alert", "product_recall"}:
+        molecule = payload.get("molecule")
+        batches = payload.get("affected_batches") or []
+        manufacturer = payload.get("manufacturer")
+        batch_text = ", ".join(str(x) for x in batches[:3])
+
+        body = (
+            f"{first}, a supply alert flags {molecule or 'a product'}"
+            f"{' from ' + str(manufacturer) if manufacturer else ''}"
+            f"{' affecting batches ' + batch_text if batch_text else ''}. "
+            "Please verify the affected stock against your inventory before any further sale/dispensing. "
+            "Want me to turn the supplied alert into a short internal checklist?"
+        )
+
+        return _specialized_action(
+            trigger, merchant, body, "vera_supply_alert_v2",
+            "Uses the supplied product, manufacturer and batch information and directs the merchant to verify affected stock without inventing regulatory instructions."
+        )
+
+    # CURIOUS ASK / LOW-FREQUENCY ENGAGEMENT
+    if kind in {"curious_ask_due", "scheduled_recurring"}:
+        signals = merchant.get("signals") or []
+        signal_text = ", ".join(str(s) for s in signals[:2]) if signals else None
+
+        body = (
+            f"{first}, quick useful check for {name}: "
+            "is there one thing you want more customers to do this week?"
+        )
+        if signal_text:
+            body += f" I can use your current signal ({signal_text}) to suggest a concrete move."
+        else:
+            body += " If you tell me the priority, I'll turn it into a ready-to-use message."
+
+        return _specialized_action(
+            trigger, merchant, body, "vera_curiosity_v2",
+            "Uses the recurring engagement trigger to start a useful business conversation rather than sending a generic promotion."
+        )
+
+    # Strong safe fallback — still grounded in the trigger.
+    title = payload.get("title") or payload.get("topic") or payload.get("reason")
+    if title:
+        body = (
+            f"{first}, {title}. "
+            "This is the specific reason I'm reaching out now. "
+            "Want me to turn it into one concrete next step?"
+        )
+    else:
+        body = (
+            f"{first}, I have a {kind.replace('_', ' ') or 'new'} signal for {name}. "
+            "Want me to turn the supplied signal into one concrete next step?"
+        )
+
+    return _specialized_action(
+        trigger, merchant, body,
+        f"vera_{kind or 'context'}_v2",
+        "Grounds the message in the trigger's supplied fact and offers one concrete next step without inventing data."
+    )
